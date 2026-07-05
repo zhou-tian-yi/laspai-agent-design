@@ -1,0 +1,70 @@
+# LASPAI MCP Server 设计方案
+
+本文档概述了将计算化学智能体底层工具调用迁移至 MCP (Model Context Protocol) 架构的服务器端功能需求与目录结构设计。
+
+---
+
+## 一、 核心功能架构
+
+### 1. 基础设施与传输层 (Infrastructure & Transport)
+* **FastAPI 融合**：采用 FastAPI 作为底层应用框架，处理全局中间件、CORS 以及服务生命周期管理。
+* **全链路追踪**：智能接力上游 `traceparent` Header——智能体端发来请求时继承其 `trace_id` 创建子 Span；第三方 REST API 直接调用时由 OTel 自动生成全新 Root Span。Span Attributes 绑定 `user_id`（从 Token 解析）、`tool_name`、`job_id`（计算任务维度）。
+* **统一日志管理 (Logging)**：配置 OTel 将 trace/span 上下文桥接到 Python `logging` 模块，通过自定义 Log Formatter 将 `trace_id`、`span_id`、`user_id` 自动注入到每行日志中，持久化记录 API 调用、鉴权状态、工具执行耗时及内部异常。
+* **SSE 路由接管**：使用 MCP SDK 的 `SseServerTransport` 接管 `/mcp/sse`（用于客户端建立长连接）和 `/mcp/messages`（用于接收客户端的 JSON-RPC 消息）。
+* **基于上下文的鉴权 (Context Auth)**：在 `/mcp/sse` 路由入口处应用 FastAPI 原生的鉴权依赖（校验 Token）。连接建立时，将解析出的 `user_id` 注入到 `contextvars` 异步上下文中，供该连接生命周期内的所有工具和资源调用共享，实现底层权限隔离。
+
+### 2. 数据持久化层 (Database & Storage)
+* **结构入库与权限绑定**：设计统一的数据库表（如 `ArtifactModel`），将化学结构文件（PDB/CIF 文本）、元数据以及所属的 `user_id` 统一持久化存储。
+* **短 ID 生成机制**：舍弃长 UUID，生成安全的、带语义前缀的短 ID（如 `mol_8f3a9b`、`crys_2b19c`）作为大模型在工具链中传递的主键参数，防范大模型幻觉与 Token 浪费。
+
+### 3. MCP 核心能力 (Capabilities)
+* **计算工具 (`@mcp.tool`)**：
+  * 接收大模型传来的短 ID（如 `input_id="mol_abc123"`）。
+  * 结合上下文中的 `user_id`，从数据库安全提取结构文本。
+  * 调用底层的化学计算集群 API（生成、优化、振动等）。
+  * 计算完成后，将新生成的结构存入数据库，仅向大模型返回结构化的元数据和新的短 ID（如 `{"status": "success", "energy": -100.5, "id": "mol_def456"}`）。
+* **资源读取 (`@mcp.resource`)**：
+  * 注册资源 URI 模板（如 `artifact://{resource_type}/{primary_key}`）。
+  * 当智能体前端或外部应用请求此 URI 时，服务器通过提取出的主键和上下文 `user_id` 查询数据库，鉴权通过后直接返回结构的纯文本内容。
+
+### 4. 混合 API (Custom Routes)
+* **独立文件上传接口**：提供标准的 `POST /api/v1/files/upload` 接口，接收前端用户手动上传的结构文件，验证后存入数据库并返回短 ID，供大模型在后续计算中直接引用。
+
+---
+
+## 二、 目录结构设计
+
+借鉴企业级 FastAPI 项目规范，实现 MCP 协议、网络路由与底层化学计算业务的彻底解耦：
+
+```text
+lasp_mcp_server/
+├── core/                       # 核心基础设施层
+│   ├── __init__.py
+│   ├── config.py               # 全局配置 (数据库URI、计算后端URL等)
+│   ├── database.py             # 数据库引擎、SQLModel数据表定义
+│   ├── security.py             # 鉴权依赖 (get_user_id) 与 user_id 上下文变量定义
+│   ├── middleware.py           # OTel traceparent 解析及全局中间件配置
+│   └── logger.py               # 统一日志配置中心（自动注入 trace_id / span_id / user_id）
+├── api/                        # FastAPI 独立路由层
+│   ├── __init__.py
+│   ├── mcp_routes.py           # /mcp/sse 和 /mcp/messages 的 SSE 传输接管路由
+│   └── upload_routes.py        # /api/v1/upload 等独立的标准 REST 接口
+├── mcp_handlers/               # MCP 协议核心实现层
+│   ├── __init__.py
+│   ├── server.py               # MCP Server 实例的初始化与配置中心
+│   ├── resources.py            # @mcp.resource 装饰器实现 (数据库短 ID 寻址与鉴权)
+│   └── tools/                  # @mcp.tool 装饰器实现 (按化学领域解耦)
+│       ├── __init__.py
+│       ├── molecule_tools.py   # 小分子生成、优化工具
+│       ├── crystal_tools.py    # 晶体生成、体相优化工具
+│       ├── surface_tools.py    # 表面切面、优化工具
+│       └── adsorp_tools.py     # 吸附构型搜索工具
+├── services/                   # 纯业务逻辑层 (供 MCP Tools 调用，隔离 MCP 协议)
+│   ├── __init__.py
+│   └── chemistry_client.py     # 封装与底层计算集群的 HTTP 交互
+├── logs/                       # 运行时日志文件存储目录
+│   └── mcp_server.log          # 滚动存储的运行日志 (包含 request_id 追踪)
+├── main.py                     # 应用主入口：组装 FastAPI 实例，挂载中间件与路由，启动服务
+├── requirements.txt            # 项目依赖
+└── .env                        # 环境变量配置
+```
