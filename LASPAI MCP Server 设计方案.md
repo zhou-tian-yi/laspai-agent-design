@@ -11,7 +11,8 @@
 * **全链路追踪**：智能接力上游 `traceparent` Header——智能体端发来请求时继承其 `trace_id` 创建子 Span；第三方 REST API 直接调用时由 OTel 自动生成全新 Root Span。Span Attributes 绑定 `user_id`（从 Token 解析）、`tool_name`、`job_id`（计算任务维度）。
 * **统一日志管理 (Logging)**：配置 OTel 将 trace/span 上下文桥接到 Python `logging` 模块，通过自定义 Log Formatter 将 `trace_id`、`span_id`、`user_id` 自动注入到每行日志中，持久化记录 API 调用、鉴权状态、工具执行耗时及内部异常。
 * **SSE 路由接管**：使用 MCP SDK 的 `SseServerTransport` 接管 `/mcp/sse`（用于客户端建立长连接）和 `/mcp/messages`（用于接收客户端的 JSON-RPC 消息）。
-* **基于上下文的鉴权 (Context Auth)**：在 `/mcp/sse` 路由入口处应用 FastAPI 原生的鉴权依赖（校验 Token）。连接建立时，将解析出的 `user_id` 注入到 `contextvars` 异步上下文中，供该连接生命周期内的所有工具和资源调用共享，实现底层权限隔离。
+* **无状态上下文鉴权**：采用无状态 Token 校验机制。要求客户端在 `GET /mcp/sse` 和 `POST /mcp/messages` 的 HTTP Header 中均携带鉴权 Token。
+* **ASGI 级路由拦截**：针对使用底层 `Mount` 挂载的 `/mcp/messages` 路由，编写自定义 ASGI 包装器（Wrapper）进行拦截。在请求进入 MCP SDK 处理之前，提取并校验 Token，将 `user_id` 实时注入当前独立请求的 `contextvars` 异步上下文中，供后方的 `@mcp.tool` 和 `@mcp.resource` 安全读取，实现多租户权限隔离。
 
 ### 2. 数据持久化层 (Database & Storage)
 * **结构入库与权限绑定**：设计统一的数据库表（如 `ArtifactModel`），将化学结构文件（PDB/CIF 文本）、元数据以及所属的 `user_id` 统一持久化存储。
