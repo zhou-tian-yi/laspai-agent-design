@@ -421,13 +421,9 @@ POST /chat/{session_id}  → Root Span (FastAPIInstrumentor 自动创建)
 
 ### 4.3 自定义 Checkpointer（`core/checkpointer.py`）
 
-> **⚠️ TODO（他人负责）**：此模块由他人负责实现，此处仅描述设计约束和对外接口。
+LangGraph 原生 `AsyncSqliteSaver` 使用追加（append）模式，多次写入导致 checkpoint 中存在冗余数据。重构后替换为**自定义 checkpointer**，采用覆盖（overwrite）模式。
 
-LangGraph 原生 `AsyncSqliteSaver` 使用追加（append）模式，多次写入导致 checkpoint 中存在冗余数据。重构后替换为**自定义 checkpointer**，采用覆盖（overwrite）模式：
-
-- 每次状态变更时，使用当前最新状态**完全覆盖**旧快照，而非追加
-- 确保 `aget_state()` 获取的始终是最新有效版本
-- 底层存储可替换（SQLite / PostgreSQL），对外暴露统一的 `BaseCheckpointSaver` 兼容接口
+自定义 checkpointer 写入数据库中的对话（conversations）表。
 
 **TODO 清单**：
 
