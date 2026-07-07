@@ -17,29 +17,34 @@ erDiagram
     Message ||--o{ ToolCall : "触发"
     ToolCall }o--o{ ArtifactState : "产出/引用"
     Message }o--o{ ArtifactState : "引用"
+    ArtifactState }o--o{ FileRecord : "file_server_ids"
 
     AgentUser {
-        string "继承网站User，扩展Agent交互字段"
+        string description "继承网站User，扩展Agent交互字段"
     }
 
     Conversation {
-        string "对话会话，含状态快照与HITL恢复数据"
+        string description "对话会话，含状态快照与HITL恢复数据"
     }
 
     Message {
-        string "对话历史条目，支持四种消息角色"
+        string description "对话历史条目，支持四种消息角色"
     }
 
     ToolCall {
-        string "MCP工具调用记录，含生命周期与链路追踪"
+        string description "MCP工具调用记录，含生命周期与链路追踪"
     }
 
     LLMConfig {
-        string "用户可配置多组LLM参数，加密存储密钥"
+        string description "用户可配置多组LLM参数，加密存储密钥"
     }
 
     ArtifactState {
-        string "制品状态，引用文件服务器ID，含化学元数据与派生链"
+        string description "制品状态，JSON数组引用多条文件记录"
+    }
+
+    FileRecord {
+        string description "物理文件元数据，含引用计数与TTL"
     }
 ```
 
@@ -48,11 +53,10 @@ erDiagram
 | 关系 | 说明 |
 | ---- | ---- |
 | AgentUser → Conversation | 一个用户可发起多个对话 |
-| AgentUser → LLMConfig | 一个用户可配置多组 LLM（含"默认"标记） |
 | Conversation → Message | 一个对话包含多条消息，按 `created_at` 排序还原历史 |
-| Message → ToolCall | 一条 assistant 消息可触发多次工具调用（并行），tool 消息通过 `tool_call_id` 回关联 |
 | ToolCall → ArtifactState | 计算工具产出 ArtifactState（如生成新分子），后续调用通过 `string_id` 引用已有制品 |
 | Message → ArtifactState | 用户上传文件产生的 ArtifactState 关联到用户消息 |
+| ArtifactState → FileRecord | M:N 关系，`file_server_ids` JSON 数组反范式存储；去重时多 artifact 共享同一文件 |
 
 ---
 
@@ -84,7 +88,7 @@ CREATE TABLE conversations (
     user_id             VARCHAR(36) NOT NULL,              -- 外键：agent_users
     title               VARCHAR(255) DEFAULT '',           -- 对话标题（LLM 自动生成或用户编辑）
     inventory_snapshot  JSON,                              -- 当前 Artifact 库存摘要（供 LLM 上下文注入）
-    checkpointer_state  MEDIUMTEXT,                        -- LangGraph 序列化状态（HITL 中断恢复）
+    checkpointer_state  BLOB,                              -- LangGraph 序列化状态，包含对话历史（HITL 中断恢复）
     message_count       INT DEFAULT 0,                     -- 冗余计数，列表排序用
     is_deleted          BOOLEAN DEFAULT FALSE,             -- 是否已删除
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -105,18 +109,16 @@ CREATE TABLE conversations (
 
 ### 2.3 messages — 对话历史条目
 
-按时间顺序存储每轮对话的用户问题和 AI 回复，支持多种消息角色。
+按时间顺序存储对话历史信息，用于在前端恢复对话历史。
 
 ```sql
 CREATE TABLE messages (
     id                VARCHAR(36) PRIMARY KEY,
-    conversation_id   VARCHAR(36) NOT NULL,                -- FK → conversations
-    role              VARCHAR(16) NOT NULL,                -- user | assistant | tool | system
+    conversation_id   VARCHAR(36) NOT NULL,                -- 外键：conversations
     content           MEDIUMTEXT,                          -- 消息正文
-    tool_calls        JSON,                                -- assistant 消息中的 tool_calls 数组
-    tool_call_id      VARCHAR(36),                         -- tool 消息关联的 tool_call 记录
+    parent_id         VARCHAR(36),                         -- 父消息 ID，用于处理层级关系
     token_count       INT DEFAULT 0,                       -- 该消息消耗的 Token 数
-    metadata          JSON,                                -- 附件、引用 Artifact、来源等
+    metadata          JSON,                                -- 附件、引用 Artifact、来源、包含节点等
     created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_msg_conv_id (conversation_id),
@@ -127,8 +129,6 @@ CREATE TABLE messages (
 | 字段 | 适用角色 | 说明 |
 | ---- | -------- | ---- |
 | `content` | 全部 | 用户输入文本、AI 回复正文、工具执行结果 |
-| `tool_calls` | assistant | LLM 返回的工具调用请求数组（`[{id, name, args}]`） |
-| `tool_call_id` | tool | 关联回对应的 `tool_calls` 记录，用于还原完整调用链路 |
 | `metadata` | 全部 | 灵活扩展：附件文件 ID、引用的 Artifact 短 ID 列表、来源标记等 |
 
 **消息角色与存储模式**：
@@ -194,13 +194,13 @@ CREATE TABLE llm_configs (
 
 ### 2.6 artifact_states — 制品状态
 
-记录化学制品的 Agent 侧状态信息。文件本体托管在文件管理服务器（有独立的元数据表），本表仅存储文件服务器引用 ID 及 Agent 系统所需的化学元数据。
+记录化学制品的 Agent 侧状态信息。文件本体托管在文件管理服务器（有独立的元数据表），本表仅存储文件服务器引用 ID 及 Agent 系统所需的化学元数据。该表对应的是当前未重构版本的 `ChemicalData` 而不是 `Artifact`。
 
 ```sql
 CREATE TABLE artifact_states (
     id                  INT AUTO_INCREMENT PRIMARY KEY,
     string_id           VARCHAR(32) NOT NULL UNIQUE,        -- 字符串ID，如 "mol_8f3a9b"
-    file_server_id      VARCHAR(36) NOT NULL,               -- 文件管理服务器的文件ID
+    file_server_ids     JSON,                               -- ["fs_aaa", "fs_bbb"] 多文件引用（反范式）
     type                VARCHAR(32) NOT NULL,               -- molecule | crystal | surface 等
     user_id             VARCHAR(36) NOT NULL,               -- 多用户户隔离
     summary             TEXT,                               -- 摘要描述，用于在不提供全文时给 LLM 提示文件的内容 
@@ -221,27 +221,69 @@ CREATE TABLE artifact_states (
 | 字段 | 说明 |
 | ---- | ---- |
 | `string_id` | Agent ↔ 文件服务器之间传递的唯一标识，对外不暴露数据库主键 |
-| `file_server_id` | 指向文件管理服务器的文件记录，文件服务器独立管理存储路径、MIME 类型、大小等 |
-| `chemical_metadata` | JSON 灵活存储化学领域元数据（formula、energy、smiles 等），随领域扩展无需 DDL |
-| `parent_artifact_id` | 自引用派生链，支持溯源（如「该分子由 mol_A 优化得到」） |
+| `file_server_ids` | JSON 数组，指向文件管理服务器的一条或多条文件记录。由于仅需从 artifact 查文件而无反向查询需求，采用反范式设计 |
 | `source` | 区分内置（builtin）、用户上传（upload）和 MCP 计算产出（computation） |
+| `is_deleted` / `deleted_at` | 软删除标记，所有引用该 artifact 的 conversation 消失后方可删除 |
 
-**与 file_records 的关系**：
+**与 file_records 的关系（M:N）**：
 
-两表均由文件管理服务器管理，通过 `file_server_id` 关联。`artifact_states` 负责化学语义，`file_records` 负责存储元数据：
+一个 artifact 可包含多个文件（如 CIF + 参数 JSON），一个文件可被多个 artifact 引用（如重复上传同一文件）。`artifact_states.file_server_ids` 以 JSON 数组反范式存储引用。
 
 ```text
-artifact_states （文件服务器）             file_records （文件服务器）
-──────────────────────────              ─────────────────────────
-  string_id                              id (PK)
-  file_server_id ───────────────▶       filename
-  type                                   original_name
-  chemical_metadata (JSON)               size_bytes
-  parent_artifact_id                     sha256
-  source                                 created_at
+artifact_states                              file_records
+──────────────                               ────────────
+  string_id                                   id (PK)
+  file_server_ids ──────[ "fs_a", ──────▶    filename
+                          "fs_b" ]  ──▶      original_name
+  type                                        size_bytes
+  chemical_metadata (JSON)                    sha256
+  parent_artifact_id                          ref_count
+  source                                      last_accessed_at
 ```
 
-Agent 读取文件时一次调用即可：`string_id → file_server_id → 物理文件`。
+Agent 读取文件时一次调用即可：`string_id → file_server_ids → 逐个查 file_records → 物理文件`。
+
+### 2.7 生命周期管理
+
+#### artifact_states 的删除
+
+采用**引用计数**策略：当所有引用该 artifact 的 conversation 均被删除（`deleted_at IS NOT NULL`）后，标记该 artifact 为软删除。具体规则：
+
+```text
+清理条件：
+  所有包含该 string_id 于 inventory_snapshot 中的 conversation
+  均满足 deleted_at IS NOT NULL
+  → 标记 artifact_states.deleted_at = NOW()
+```
+
+- `deleted_at` 仅标记，不立即物理删除，支持宽限期内的恢复
+- 定期清理任务统一处理 `deleted_at` 超过宽限期（如 30 天）的记录
+
+#### 物理文件的引用计数与过期
+
+物理文件独立于 artifact 存在：删除文件不影响 artifact 记录，但文件必须被至少一个 artifact 引用才能保留。
+
+| 规则 | 说明 |
+|------|------|
+| 引用计数 | `file_records.ref_count` = 引用该文件的 artifact 数量 |
+| 减引用 | artifact 软删除或 `file_server_ids` 更新时，对应文件 `ref_count -= 1` |
+| 零引用清理 | `ref_count = 0` 时立即删除物理文件及 `file_records` 记录 |
+| TTL 过期 | 文件 `last_accessed_at` 超过 7 天未访问，即使 `ref_count > 0` 也触发物理删除 |
+| 过期不删 artifact | TTL 删除只移除物理文件和 `file_records`，`artifact_states` 保留，`file_server_ids` 中对应 ID 标记为失效 |
+
+```text
+物理文件生命周期：
+
+  上传 → ref_count >= 1, last_accessed_at = NOW()
+   ↓
+  每次下载 → 更新 last_accessed_at
+   ↓
+  ┌─ ref_count = 0 ──────────→ 立即删除物理文件 + file_records
+  └─ last_accessed_at > 7天 ─→ TTL 过期，删除物理文件 + file_records
+                                （artifact_states 保留，file_server_ids 标记失效）
+```
+
+TTL 检查由文件管理服务器的定时任务执行（如每小时扫描一次），无需 Agent 侧感知。
 
 ---
 

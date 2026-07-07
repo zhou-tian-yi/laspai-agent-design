@@ -88,49 +88,54 @@ def file_path(user_id: str, file_id: str, extension: str) -> str:
 
 ### 3.1 file_records — 文件元数据
 
-与 Agent DB 中的 `artifact_states` 分工明确：`file_records` 管存储元数据，`artifact_states` 管化学语义元数据，通过 `file_server_id` 关联。
+`artifact_states` 与 `file_records` 为 M:N 关系：一个 artifact 可引用多个文件，一个文件可被多个 artifact 引用（去重场景）。引用关系通过 `artifact_states.file_server_ids` JSON 数组反范式存储。
 
 ```sql
 CREATE TABLE file_records (
-    id              VARCHAR(36) PRIMARY KEY,            -- artifact_states.file_server_id 指向这里
+    id              VARCHAR(36) PRIMARY KEY,
     user_id         VARCHAR(36) NOT NULL,               -- 多用户隔离
     filename        VARCHAR(255) NOT NULL,              -- 物理文件名，如 a3b9c2d1.pdb
     original_name   VARCHAR(255),                       -- 用户上传时的原始文件名
     extension       VARCHAR(16),                        -- pdb / cif / xyz / mol / sdf
     size_bytes      INT,                                -- 文件大小
     sha256          VARCHAR(64),                        -- SHA256 哈希（去重 + 完整性校验）
+    ref_count       INT DEFAULT 1,                      -- 引用计数（被几个 artifact 引用）
+    last_accessed_at DATETIME,                          -- 最后访问时间（TTL 过期依据）
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_fr_user_id (user_id),
-    INDEX idx_fr_sha256 (sha256)
+    INDEX idx_fr_sha256 (sha256),
+    INDEX idx_fr_last_accessed (last_accessed_at)
 );
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `id` | 主键，供 `artifact_states.file_server_id` 外键引用 |
+| `id` | 主键，值存储在 `artifact_states.file_server_ids` JSON 数组中 |
 | `user_id` | 多租户隔离，与 Agent 侧一致 |
 | `filename` | 实际存储的文件名，由 file_id + extension 拼接 |
 | `original_name` | 用户上传时的原始文件名，供展示和下载还原 |
 | `sha256` | 写入后计算哈希，用于去重和完整性校验 |
+| `ref_count` | 引用计数。上传/去重命中时 +1；artifact 删除或解除引用时 -1；归零时清理物理文件 |
+| `last_accessed_at` | 每次下载时更新；超过 7 天未访问触发 TTL 过期删除 |
 
-### 3.2 与 artifact_states 的关系
-
-两张表均由文件服务器管理，通过 `file_server_id` 关联：
+### 3.2 与 artifact_states 的关系（M:N）
 
 ```text
-artifact_states （文件服务器管理）         file_records （文件服务器管理）
-──────────────────────────────           ──────────────────────────────
-  id (INT PK, 内部用)                     id (VARCHAR PK)
-  string_id ("mol_8f3a9b")               filename ("a3b9c2d1.pdb")
-  file_server_id ────────────────▶       user_id
-  type (molecule/crystal/...)            original_name
-  chemical_metadata (JSON)               size_bytes
-  parent_artifact_id                     sha256
-  source (upload/computation)            created_at
+artifact_states                              file_records
+──────────────                               ────────────
+  string_id                                   id (PK)
+  file_server_ids  ────[ "fs_a", ──────▶     filename
+                         "fs_b" ] ────▶      original_name
+  type                                        size_bytes
+  chemical_metadata (JSON)                    sha256
+  parent_artifact_id                          ref_count
+  source                                      last_accessed_at
 ```
 
-智能体端读取文件内容时只需一次调用：`string_id → artifact_states → file_server_id → 物理文件`。
+- `artifact_states.file_server_ids` 是 JSON 数组，存储一个或多个 `file_records.id`
+- 仅需从 artifact 查文件，无反向查询需求，因此反范式设计可行
+- 读取链路：`string_id → file_server_ids → 逐个查 file_records → 物理文件`
 
 ---
 
@@ -138,63 +143,25 @@ artifact_states （文件服务器管理）         file_records （文件服务
 
 ### 4.1 文件上传（含去重 + artifact 创建）
 
-一次调用完成物理存储、去重、`file_records` 和 `artifact_states` 写入，返回 `string_id`。
-
-```python
-import hashlib
-
-class FileService:
-    def upload_and_register(
-        self, user_id: str, content: bytes,
-        original_name: str, artifact_type: str,
-        chemical_metadata: dict = None,
-        parent_artifact_id: str = None,
-    ) -> str:
-        """
-        上传文件并注册为 artifact。返回 string_id（如 "mol_8f3a9b"）。
-        """
-        sha256 = hashlib.sha256(content).hexdigest()
-
-        # 去重：相同哈希的文件只存一份物理文件
-        existing_file = db.query(FileRecord).filter_by(sha256=sha256).first()
-        if existing_file:
-            file_server_id = existing_file.id
-        else:
-            file_server_id = generate_uuid()
-            ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
-            self._write_physical(user_id, file_server_id, ext, content)
-            self._insert_file_record(file_server_id, user_id, original_name, ext, content, sha256)
-
-        # 创建 artifact_states 记录（string_id 内部生成）
-        string_id = f"{artifact_type[:3]}_{generate_short_id()}"
-        artifact = ArtifactState(
-            string_id=string_id,
-            file_server_id=file_server_id,
-            type=artifact_type,
-            user_id=user_id,
-            chemical_metadata=chemical_metadata or {},
-            parent_artifact_id=parent_artifact_id,
-            source="upload",
-        )
-        db.add(artifact)
-        db.commit()
-        return string_id
-```
-
-上传统一入口后，智能体端不再需要分两次调用（先存文件再写元数据）。
+一次调用完成物理存储、去重、`file_records` 和 `artifact_states` 写入，返回 `string_id`。去重命中时递增 `ref_count` 而非新建记录。
 
 ### 4.2 文件下载
 
-按 `string_id` 一步完成查询和读取，调用方无需关心 `file_server_id` 中间层：
+按 `string_id` 一步完成查询和读取，同时刷新 `last_accessed_at` 以续期 TTL：
 
 ```python
     def download_by_string_id(self, string_id: str) -> bytes:
-        """按 string_id 读取文件内容。"""
         artifact = db.query(ArtifactState).filter_by(string_id=string_id).first()
-        if not artifact:
+        if not artifact or not artifact.file_server_ids:
             raise FileNotFoundError(f"Artifact {string_id} not found")
 
-        file_record = db.query(FileRecord).filter_by(id=artifact.file_server_id).first()
+        # 取第一个文件（通常只有一个）
+        file_record = db.query(FileRecord).filter_by(
+            id=artifact.file_server_ids[0]
+        ).first()
+        file_record.last_accessed_at = datetime.utcnow()  # TTL 续期
+        db.commit()
+
         path = os.path.join("files", file_record.user_id,
                             file_record.filename[:2], file_record.filename)
         with open(path, "rb") as f:
@@ -203,19 +170,39 @@ class FileService:
 
 ### 4.3 用户删除
 
-删除用户时，清理其全部文件和一整条 `file_records` 记录，目录级操作：
+删除用户时清理其全部物理文件和相关记录，各文件 `ref_count` 同步递减：
 
 ```python
     def delete_user_files(self, user_id: str):
-        """删除用户所有文件及元数据。"""
         import shutil
         user_dir = os.path.join("files", user_id)
         if os.path.exists(user_dir):
             shutil.rmtree(user_dir)
-
         db.query(FileRecord).filter_by(user_id=user_id).delete()
         db.commit()
 ```
+
+### 4.4 TTL 过期清理
+
+定时任务（如每小时）扫描 `last_accessed_at` 超过 7 天的文件并清理。物理删除不影响 `artifact_states`：
+
+```python
+    def cleanup_expired_files(self, ttl_days: int = 7):
+        cutoff = datetime.utcnow() - timedelta(days=ttl_days)
+        expired = db.query(FileRecord).filter(
+            FileRecord.last_accessed_at < cutoff
+        ).all()
+
+        for record in expired:
+            path = os.path.join("files", record.user_id,
+                                record.filename[:2], record.filename)
+            if os.path.exists(path):
+                os.remove(path)
+            db.delete(record)
+        db.commit()
+```
+
+> TTL 删除只移除物理文件和 `file_records` 记录，`artifact_states` 保留，其 `file_server_ids` 中对应 ID 标记为失效。
 
 ---
 
@@ -233,12 +220,12 @@ sequenceDiagram
     AG->>FS: upload_and_register(user_id, content, name, type, metadata)
     FS->>FS: 计算 SHA256
     alt 已存在（去重命中）
-        FS->>FS: 复用已有 file_server_id
+        FS->>FS: file_records.ref_count += 1
     else 新文件
         FS->>FS: 写入 files/{user_id}/{id}.ext
-        FS->>FS: 写入 file_records
+        FS->>FS: 写入 file_records (ref_count=1)
     end
-    FS->>FS: 写入 artifact_states (生成 string_id)
+    FS->>FS: 写入 artifact_states (file_server_ids=[...])
     FS-->>AG: 返回 string_id
     AG-->>FE: SSE 推送上传完成
 ```
@@ -251,8 +238,9 @@ sequenceDiagram
     participant FS as 文件服务器
 
     SA->>FS: download_by_string_id(string_id)
-    FS->>FS: 查 artifact_states → 获取 file_server_id
+    FS->>FS: 查 artifact_states → 获取 file_server_ids
     FS->>FS: 查 file_records → 定位物理文件
+    FS->>FS: 刷新 last_accessed_at (TTL 续期)
     FS-->>SA: 返回 PDB/CIF 文本内容
 ```
 
@@ -271,6 +259,9 @@ sequenceDiagram
 | 不启用对象存储 | 暂不引入 MinIO/S3 | 当前规模不需要，过度设计徒增运维复杂度 |
 | 大文件 | 不做分片 | 化学结构文件（PDB/CIF）通常 < 500KB，单次读写即可 |
 | 生命周期 | 文件服务器统一管理 | 物理文件 + artifact_states 同生命周期，删除时一并清理 |
+| 物理文件 TTL | 7 天未访问自动删除 | 定时任务扫描 `last_accessed_at`；删文件不删 artifact |
+| Artifact ↔ File | M:N 关系 | 一个 artifact 可含多个文件；去重时一个文件被多个 artifact 引用 |
+| 反范式 | `file_server_ids` JSON 数组 | 仅 artifact→file 方向查询，无需反向，JSON 数组更简单 |
 
 ---
 
