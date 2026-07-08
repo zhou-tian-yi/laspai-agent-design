@@ -1,6 +1,6 @@
 # LASPAI 智能体文件管理端设计方案
 
-本文档描述 LASPAI 项目中文件管理服务器（File Server）的完整架构设计。文件服务器定位为 **数据服务**，统一管理物理文件存储、file_records 元数据以及 artifact_states 化学制品的全生命周期。客户端使用 SQLAlchemy ORM 连接数据库，通过 Alembic 管理 schema 迁移。
+本文档描述 LASPAI 项目中文件管理服务器（File Server）的完整架构设计。文件服务器定位为 **数据服务**，统一管理物理文件存储、file_records 元数据以及 artifact_states 化学制品的全生命周期。客户端使用 SQLAlchemy ORM 连接数据库。
 
 ---
 
@@ -43,6 +43,21 @@ flowchart TB
 
 - 智能体端直连文件服务器完成所有数据操作（物理文件 + artifact_states）
 - 第三方客户只能通过 MCP 服务端间接访问
+
+### 1.1 目录结构
+
+```text
+lasp_file_server/
+├── core/
+│   ├── database.py                # 数据库引擎（管理全部业务表）
+│   ├── models.py                  # ORM 模型（file_records / artifact_states 等）
+│   └── storage.py                 # 物理存储抽象（file_path 等）
+├── services/
+│   └── file_service.py            # upload_and_register / download_by_string_id
+├── main.py
+├── requirements.txt
+└── .env
+```
 
 ---
 
@@ -99,13 +114,10 @@ CREATE TABLE file_records (
     extension       VARCHAR(16),                        -- pdb / cif / xyz / mol / sdf
     size_bytes      INT,                                -- 文件大小
     sha256          VARCHAR(64),                        -- SHA256 哈希（去重 + 完整性校验）
-    ref_count       INT DEFAULT 1,                      -- 引用计数（被几个 artifact 引用）
-    last_accessed_at DATETIME,                          -- 最后访问时间（TTL 过期依据）
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_fr_user_id (user_id),
-    INDEX idx_fr_sha256 (sha256),
-    INDEX idx_fr_last_accessed (last_accessed_at)
+    INDEX idx_fr_sha256 (sha256)
 );
 ```
 
@@ -116,8 +128,6 @@ CREATE TABLE file_records (
 | `filename` | 实际存储的文件名，由 file_id + extension 拼接 |
 | `original_name` | 用户上传时的原始文件名，供展示和下载还原 |
 | `sha256` | 写入后计算哈希，用于去重和完整性校验 |
-| `ref_count` | 引用计数。上传/去重命中时 +1；artifact 删除或解除引用时 -1；归零时清理物理文件 |
-| `last_accessed_at` | 每次下载时更新；超过 7 天未访问触发 TTL 过期删除 |
 
 ### 3.2 与 artifact_states 的关系（M:N）
 
@@ -129,8 +139,7 @@ artifact_states                              file_records
                          "fs_b" ] ────▶      original_name
   type                                        size_bytes
   chemical_metadata (JSON)                    sha256
-  parent_artifact_id                          ref_count
-  source                                      last_accessed_at
+  parent_artifact_id                          created_at
 ```
 
 - `artifact_states.file_server_ids` 是 JSON 数组，存储一个或多个 `file_records.id`
@@ -143,11 +152,11 @@ artifact_states                              file_records
 
 ### 4.1 文件上传（含去重 + artifact 创建）
 
-一次调用完成物理存储、去重、`file_records` 和 `artifact_states` 写入，返回 `string_id`。去重命中时递增 `ref_count` 而非新建记录。
+一次调用完成物理存储、去重、`file_records` 和 `artifact_states` 写入，返回 `string_id`。
 
 ### 4.2 文件下载
 
-按 `string_id` 一步完成查询和读取，同时刷新 `last_accessed_at` 以续期 TTL：
+按 `string_id` 一步完成查询和读取：
 
 ```python
     def download_by_string_id(self, string_id: str) -> bytes:
@@ -155,12 +164,9 @@ artifact_states                              file_records
         if not artifact or not artifact.file_server_ids:
             raise FileNotFoundError(f"Artifact {string_id} not found")
 
-        # 取第一个文件（通常只有一个）
         file_record = db.query(FileRecord).filter_by(
             id=artifact.file_server_ids[0]
         ).first()
-        file_record.last_accessed_at = datetime.utcnow()  # TTL 续期
-        db.commit()
 
         path = os.path.join("files", file_record.user_id,
                             file_record.filename[:2], file_record.filename)
@@ -170,7 +176,7 @@ artifact_states                              file_records
 
 ### 4.3 用户删除
 
-删除用户时清理其全部物理文件和相关记录，各文件 `ref_count` 同步递减：
+删除用户时清理其全部物理文件和 `file_records` 记录：
 
 ```python
     def delete_user_files(self, user_id: str):
@@ -182,27 +188,37 @@ artifact_states                              file_records
         db.commit()
 ```
 
-### 4.4 TTL 过期清理
+### 4.4 定期清理
 
-定时任务（如每小时）扫描 `last_accessed_at` 超过 7 天的文件并清理。物理删除不影响 `artifact_states`：
+定时任务（如每日）扫描 `artifact_states` 和 `conversations`，清理不再需要的物理文件：
 
 ```python
-    def cleanup_expired_files(self, ttl_days: int = 7):
-        cutoff = datetime.utcnow() - timedelta(days=ttl_days)
-        expired = db.query(FileRecord).filter(
-            FileRecord.last_accessed_at < cutoff
+    def cleanup_orphan_files(self):
+        """清理所属对话已删除或归档超期的物理文件。"""
+        cutoff_deleted = datetime.utcnow() - timedelta(days=30)   # 软删除宽限期
+        cutoff_archived = datetime.utcnow() - timedelta(days=7)   # 归档保留期
+
+        orphan_artifacts = db.query(ArtifactState).join(Conversation).filter(
+            or_(
+                Conversation.deleted_at < cutoff_deleted,
+                and_(Conversation.status == 'archived',
+                     Conversation.updated_at < cutoff_archived),
+            )
         ).all()
 
-        for record in expired:
-            path = os.path.join("files", record.user_id,
-                                record.filename[:2], record.filename)
-            if os.path.exists(path):
-                os.remove(path)
-            db.delete(record)
+        for artifact in orphan_artifacts:
+            for file_id in (artifact.file_server_ids or []):
+                record = db.query(FileRecord).filter_by(id=file_id).first()
+                if record:
+                    path = os.path.join("files", record.user_id,
+                                        record.filename[:2], record.filename)
+                    if os.path.exists(path):
+                        os.remove(path)
+                    db.delete(record)
         db.commit()
 ```
 
-> TTL 删除只移除物理文件和 `file_records` 记录，`artifact_states` 保留，其 `file_server_ids` 中对应 ID 标记为失效。
+> 清理依据为 conversation 状态，而非文件访问时间。物理文件删除后 artifact_states 保留，`file_server_ids` 中对应 ID 标记为失效。
 
 ---
 
@@ -220,10 +236,10 @@ sequenceDiagram
     AG->>FS: upload_and_register(user_id, content, name, type, metadata)
     FS->>FS: 计算 SHA256
     alt 已存在（去重命中）
-        FS->>FS: file_records.ref_count += 1
+        FS->>FS: 复用已有 file_server_id
     else 新文件
         FS->>FS: 写入 files/{user_id}/{id}.ext
-        FS->>FS: 写入 file_records (ref_count=1)
+        FS->>FS: 写入 file_records
     end
     FS->>FS: 写入 artifact_states (file_server_ids=[...])
     FS-->>AG: 返回 string_id
@@ -240,7 +256,6 @@ sequenceDiagram
     SA->>FS: download_by_string_id(string_id)
     FS->>FS: 查 artifact_states → 获取 file_server_ids
     FS->>FS: 查 file_records → 定位物理文件
-    FS->>FS: 刷新 last_accessed_at (TTL 续期)
     FS-->>SA: 返回 PDB/CIF 文本内容
 ```
 
@@ -259,8 +274,8 @@ sequenceDiagram
 | 不启用对象存储 | 暂不引入 MinIO/S3 | 当前规模不需要，过度设计徒增运维复杂度 |
 | 大文件 | 不做分片 | 化学结构文件（PDB/CIF）通常 < 500KB，单次读写即可 |
 | 生命周期 | 文件服务器统一管理 | 物理文件 + artifact_states 同生命周期，删除时一并清理 |
-| 物理文件 TTL | 7 天未访问自动删除 | 定时任务扫描 `last_accessed_at`；删文件不删 artifact |
-| Artifact ↔ File | M:N 关系 | 一个 artifact 可含多个文件；去重时一个文件被多个 artifact 引用 |
+| 文件清理 | 基于 conversation 状态定期清理 | 对话删除 30 天或归档 7 天后清理物理文件；不使用引用计数 |
+| Artifact ↔ File | M:N 关系 | 一个 artifact 可含多个文件；去重时多 artifact 共享同一文件 |
 | 反范式 | `file_server_ids` JSON 数组 | 仅 artifact→file 方向查询，无需反向，JSON 数组更简单 |
 
 ---

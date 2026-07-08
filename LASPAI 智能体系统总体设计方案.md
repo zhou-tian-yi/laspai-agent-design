@@ -59,7 +59,7 @@ flowchart TB
         end
     end
 
-    subgraph MCPSERVER["MCP 服务端 (lasp_mcp_server)<br/>职责：计算网关"]
+    subgraph MCPSERVER["MCP 服务端 (laspai_mcp_server)<br/>职责：计算网关"]
         direction TB
         MCP_DESC["接收 tool call → 调用计算集群<br/>→ 结果写回文件服务器"]
         MCP_EXT["对外代理：REST 上传 + MCP 资源下载"]
@@ -92,7 +92,7 @@ flowchart TB
 
 > 详细设计见 → [LASPAI 智能体端设计方案](./LASPAI%20智能体端设计方案.md)
 
-### 3.2 MCP 服务端（`lasp_mcp_server/`）
+### 3.2 MCP 服务端（`laspai_mcp_server/`）
 
 | 维度           | 说明                                                                 |
 | -------------- | -------------------------------------------------------------------- |
@@ -113,7 +113,7 @@ flowchart TB
 | **对 MCP 端** | 接收代理请求（第三方通路），计算完成后回写 artifact_states                     |
 | **存储方案** | `files/{user_id}/{file_id}.{ext}` 本地文件系统平铺                             |
 | **去重**     | SHA256 哈希，同文件只存一份                                                    |
-| **技术栈**   | Python + SQLAlchemy + Alembic                                                  |
+| **技术栈**   | Python + SQLAlchemy                                                  |
 
 > 详细设计见 → [LASPAI 智能体文件管理端设计方案](./LASPAI%20智能体文件管理端设计方案.md)
 
@@ -122,7 +122,7 @@ flowchart TB
 | 维度         | 说明                                                                                     |
 | ------------ | ---------------------------------------------------------------------------------------- |
 | **定位**     | 唯一事实来源，由文件管理服务器统一管理，Agent 内部直连、第三方经 MCP 代理                |
-| **DBMS**     | MySQL（与网站本体共享实例），通过 SQLAlchemy + Alembic 管理 schema 迁移                  |
+| **DBMS**     | MySQL（与网站本体共享实例），通过人工手写 SQL 脚本管理 schema 迁移                  |
 | **存储内容** | agent_users、conversations、messages、tool_calls、llm_configs、artifact_states、file_records |
 | **访问方式** | 智能体端直连（内部通路）；MCP 服务端代理（第三方通路）                                   |
 
@@ -193,133 +193,19 @@ flowchart LR
 
 ---
 
-## 五、目录结构全景
+## 五、目录结构
 
-```text
-lasp_agent/                        # 智能体端
-├── server.py
-├── api/                           # HTTP 接口层
-│   ├── deps.py
-│   ├── schemas.py
-│   └── routers/
-│       ├── chat.py
-│       ├── sessions.py
-│       ├── llm_config.py
-│       └── parse.py
-├── core/                          # 纯基础设施
-│   ├── config/
-│   │   ├── env_settings.py
-│   │   ├── models.py
-│   │   ├── paths.py
-│   │   └── setup_logging.py
-│   ├── entities/                  # 化学数据实体
-│   │   ├── base.py
-│   │   ├── molecule.py
-│   │   ├── crystal.py
-│   │   ├── phonon.py
-│   │   ├── spectral.py
-│   │   ├── md.py
-│   │   ├── go.py
-│   │   ├── collection.py
-│   │   └── helpers.py
-│   ├── database.py                # 数据库引擎（直连）
-│   ├── checkpointer.py            # 自定义 checkpointer（覆盖模式）
-│   ├── telemetry.py              # OpenTelemetry 初始化：TracerProvider、自动插桩注册
-│   ├── context.py                 # contextvars：user_id、user_token
-│   └── mcp_client.py              # MCP 客户端（仅计算）
-├── services/                      # 应用编排
-│   ├── system.py
-│   └── session.py
-├── main_agent/                    # 主智能体
-│   ├── graph.py
-│   ├── state.py
-│   ├── prompts.py
-│   ├── constants.py
-│   ├── utils.py
-│   ├── llm_presenter.py
-│   └── tools/
-│       ├── base.py
-│       ├── manager.py
-│       └── reader/
-├── sub_agents/                    # 子智能体群
-│   ├── manager.py
-│   ├── base/
-│   │   ├── blueprint.py
-│   │   ├── nodes.py
-│   │   └── state.py
-│   ├── mol_agent/
-│   ├── crys_agent/
-│   ├── surf_agent/
-│   ├── adsorp_agent/
-│   ├── prop_agent/
-│   ├── md_agent/
-│   ├── go_agent/
-│   └── db_query_agent/
-├── ui/                            # 前端交互适配
-│   ├── manager.py
-│   ├── sse_adapter.py
-│   └── base/
-│       ├── handler.py
-│       ├── state.py
-│       ├── element.py
-│       └── artifact_helper.py
-├── ask_service/                   # RAG 问答
-│   ├── data/
-│   ├── doc_loader.py
-│   ├── graph.py
-│   └── prompts.py
-├── utils/
-│   └── thermo_formatter.py
-├── requirements.txt
-└── .env
+> 为防止多处维护导致不一致，各模块的目录结构定义已统一下放到各自的说明文档中：
 
-lasp_mcp_server/                   # MCP 服务端
-├── core/
-│   ├── config.py
-│   ├── database.py
-│   ├── security.py
-│   ├── middleware.py
-│   └── logger.py
-├── api/
-│   ├── mcp_routes.py
-│   └── upload_routes.py
-├── mcp_handlers/
-│   ├── server.py
-│   ├── resources.py
-│   └── tools/
-│       ├── molecule_tools.py
-│       ├── crystal_tools.py
-│       ├── surface_tools.py
-│       └── adsorp_tools.py
-├── services/
-│   └── chemistry_client.py
-├── logs/
-├── main.py
-├── requirements.txt
-└── .env
+| 模块 | 目录结构参见 |
+|------|------------|
+| 智能体端 | [LASPAI 智能体端设计方案 §二](./LASPAI%20智能体端设计方案.md) |
+| MCP 服务端 | [LASPAI MCP Server 设计方案 §二](./LASPAI%20MCP%20Server%20设计方案.md) |
+| 文件管理服务器 | [LASPAI 智能体文件管理端设计方案 §一](./LASPAI%20智能体文件管理端设计方案.md) |
 
-lasp_file_server/                  # 文件管理服务器
-├── core/
-│   ├── database.py                # 数据库引擎（管理全部业务表）
-│   ├── models.py                  # ORM 模型（file_records / artifact_states）
-│   └── storage.py                 # 物理存储抽象（file_path 等）
-├── services/
-│   └── file_service.py            # upload_and_register / download_by_string_id
-├── main.py
-├── requirements.txt
-└── .env
+数据库表由 SQLAlchemy ORM 创建，迁移使用人工手写 SQL 脚本。
 
-database/                          # 数据库（由文件管理服务器管理）
-├── schema/                        # 表结构定义
-│   ├── agent_users.sql
-│   ├── conversations.sql
-│   ├── messages.sql
-│   ├── tool_calls.sql
-│   ├── llm_configs.sql
-│   ├── artifact_states.sql
-│   └── file_records.sql
-└── migrations/                    # Alembic 迁移脚本
-```
+---
 
 ---
 

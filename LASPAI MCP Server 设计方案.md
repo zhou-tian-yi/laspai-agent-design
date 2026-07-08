@@ -39,17 +39,27 @@ laspai_mcp_server/
 │   ├── __init__.py
 │   ├── config.py               # 全局配置 (环境读取)
 │   ├── database.py             # 数据库连接池配置
-│   ├── models.py               # 数据库 ORM 模型定义
-│   ├── logger.py               # 结合 contextvars 的上下文日志配置
 │   ├── security.py             # MCP Dependencies 鉴权逻辑
+│   ├── middleware.py            # FastAPI 中间件
 │   └── context.py              # 上下文变量（用于日志）
+├── models/                     # ORM 模型定义
+│   └── __init__.py
+├── utils/                      # 跨模块通用工具
+│   ├── __init__.py
+│   └── logger.py               # 结合 contextvars 的上下文日志配置
+├── api/                        # REST API 层（独立于 MCP 协议）
+│   ├── mcp_routes.py           # MCP 协议端点挂载
+│   └── upload_routes.py        # REST 文件上传端点
 ├── mcp_handlers/               # MCP 协议核心实现层
 │   ├── __init__.py
 │   ├── server.py               # 实例化 MCPServer，挂载 tools 与 resources
-│   ├── resources.py            # @mcp.resource 实现
-│   └── tools/                  # @mcp.tool 实现目录
-│       ├── __init__.py
-│       └── organic_tools.py    # 具体领域的计算工具
+│   └── resources.py            # @mcp.resource 实现
+├── tools/                      # @mcp.tool 实现目录
+│   ├── __init__.py
+│   ├── molecule_tools.py       # 小分子计算工具
+│   ├── crystal_tools.py        # 晶体计算工具
+│   ├── surface_tools.py        # 表面计算工具
+│   └── adsorp_tools.py         # 吸附计算工具
 ├── services/                   # 纯业务逻辑层
 │   ├── __init__.py
 │   └── chemistry_client.py     # 封装与底层高算力集群的交互
@@ -57,6 +67,6 @@ laspai_mcp_server/
 │   └── mcp_server.log          # 自动注入 user_id 的追踪日志
 ├── __init__.py
 ├── main.py                     # 主入口：支持 SSE 和 STDIO 启动
-├── requirements.txt            
+├── requirements.txt
 └── .env
 ```
