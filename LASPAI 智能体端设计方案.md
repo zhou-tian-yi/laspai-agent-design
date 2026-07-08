@@ -313,6 +313,8 @@ class MCPClient:
 - **traceparent 透传**：每次 `call_tool` 通过 OTel 的 `inject()` 自动将当前 trace context 注入 HTTP `traceparent` Header，MCP Server 端继承同一 `trace_id`
 - **连接复用**：所有子智能体共享同一个 SSE 连接，避免重复建连开销
 
+> **待讨论：脚本执行与任务队列**。MCP 服务端当前在服务器本地执行计算脚本，耗时从秒级到数分钟不等。对于较长时间的计算，MCP 的请求-响应模式会阻塞连接。可引入任务队列系统将同步调用改为提交/轮询模式——可选方案包括 Celery + Redis（轻量，Python 原生）或 RabbitMQ（功能完备，运维成本更高）。具体选型待根据实际负载评估后确定。`tool_calls` 表已预留 `task_id` 字段以对接队列系统。
+
 ### 4.2 全链路追踪 — OpenTelemetry（`core/telemetry.py` + `core/config/setup_logging.py` + `core/mcp_client.py`）
 
 采用 OpenTelemetry SDK 实现无侵入自动插桩，废止自定义 `request_id`，改用 W3C `traceparent` 标准协议。

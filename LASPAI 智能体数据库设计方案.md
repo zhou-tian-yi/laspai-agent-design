@@ -157,6 +157,7 @@ CREATE TABLE tool_calls (
     status          VARCHAR(16) DEFAULT 'pending',         -- pending | running | success | error
     error_message   TEXT,                                  -- 错误详情
     trace_id        VARCHAR(64),                           -- 追踪 trace_id（关联 MCP Server 日志）
+    task_id         VARCHAR(64),                           -- Celery / 队列系统的任务 ID（异步计算场景）
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -171,6 +172,7 @@ CREATE TABLE tool_calls (
 - `tool_name` 存的是 MCP 工具全名，可直接用于性能聚合（如统计各工具平均耗时）
 - `artifact_ids` 存短 ID 数组，与 artifact_states 表解耦（不设外键，避免跨服务强依赖）
 - `trace_id` 与 OpenTelemetry 体系对齐，用于跨服务调用链排查
+- `task_id` 关联任务队列（Celery / RabbitMQ），用于异步计算场景的状态追踪和历史审计
 
 ### 2.5 llm_configs — LLM 配置
 
