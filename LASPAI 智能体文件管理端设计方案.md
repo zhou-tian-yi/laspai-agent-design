@@ -65,34 +65,35 @@ lasp_file_server/
 
 ### 2.1 目录结构
 
-采用 **user_id 一级目录** 的方案，和目前的处理方式保持对齐，最小化修改。
+采用 **SHA256 内容寻址**，与 Git object store 同理。物理文件路径由内容哈希决定，天然去重，无需用户归属：
 
 ```text
 files/
-├── u_abc123/              # 用户目录（按 user_id）
-│   └── b1c4d9e5.cif
-├── u_def456/              # 文件少的用户：直接平铺
-│   └── f83a9b2c.xyz
+├── a3/
+│   ├── a3b9c2d1e5f6789012345678901234567890abcd1234567890abcdef123456.pdb
+│   └── a3f7e8a2c4d5e6789012345678901234567890abcd1234567890abcdef123456.cif
+├── f8/
+│   └── f83a9b2c4d5e6789012345678901234567890abcd1234567890abcdef123456.xyz
 └── ...
 ```
 
 | 设计要素 | 选择 | 理由 |
 |---------|------|------|
-| 次级目录 | `user_id` | 用户 ID 不变、不含特殊字符、天然隔离（删除用户 = 删除整个目录），加快查询速度 |
-| 文件命名 | `{file_id}.{ext}` | 唯一、无冲突、易于定位 |
-| 扩展名 | 保留原始扩展名 | 便于人工排查和工具识别 |
+| 寻址方式 | SHA256 前 2 字符 → 子目录 | 256 个桶均匀分布，防单目录膨胀 |
+| 文件命名 | `{sha256}.{ext}` | 内容决定路径，多用户自动共享同一物理文件 |
+| 用户隔离 | `file_records.user_id` 在数据库层 | 物理层不隔离，用户在 DB 层通过 record 归属区分 |
 
 ### 2.2 路径生成
 
 ```python
 import os
 
-def file_path(user_id: str, file_id: str, extension: str) -> str:
-    """返回物理存储路径，自动创建所需目录。"""
-    prefix = file_id[:2]
-    path = os.path.join("files", user_id, prefix)
+def file_path(sha256: str, extension: str) -> str:
+    """由 SHA256 计算物理路径：files/{前2位}/{完整sha256}.{ext}"""
+    prefix = sha256[:2]
+    path = os.path.join("files", prefix)
     os.makedirs(path, exist_ok=True)
-    return os.path.join(path, f"{file_id}.{extension}")
+    return os.path.join(path, f"{sha256}.{extension}")
 ```
 
 如果未来迁移到对象存储（MinIO / S3），只需替换此函数的实现，数据库 schema 无需变动。
@@ -103,13 +104,13 @@ def file_path(user_id: str, file_id: str, extension: str) -> str:
 
 ### 3.1 file_records — 文件元数据
 
-`artifact_states` 与 `file_records` 为 M:N 关系：一个 artifact 可引用多个文件，一个文件可被多个 artifact 引用（去重场景）。引用关系通过 `artifact_states.file_server_ids` JSON 数组反范式存储。
+`artifact_states` 与 `file_records` 为 M:N 关系。物理文件与 `file_records` 并非一一对应：多个 `file_records` 可指向同一物理文件（SHA256 相同），实现物理层去重而不依赖引用计数。
 
 ```sql
 CREATE TABLE file_records (
     id              VARCHAR(36) PRIMARY KEY,
     user_id         VARCHAR(36) NOT NULL,               -- 多用户隔离
-    filename        VARCHAR(255) NOT NULL,              -- 物理文件名，如 a3b9c2d1.pdb
+    filename        VARCHAR(255) NOT NULL,              -- 物理文件名 {sha256}.{ext}
     original_name   VARCHAR(255),                       -- 用户上传时的原始文件名
     extension       VARCHAR(16),                        -- pdb / cif / xyz / mol / sdf
     size_bytes      INT,                                -- 文件大小
@@ -125,9 +126,9 @@ CREATE TABLE file_records (
 |------|------|
 | `id` | 主键，值存储在 `artifact_states.file_server_ids` JSON 数组中 |
 | `user_id` | 多租户隔离，与 Agent 侧一致 |
-| `filename` | 实际存储的文件名，由 file_id + extension 拼接 |
+| `filename` | 物理文件名 `{sha256}.{ext}`，同内容文件天然共享同一物理路径 |
 | `original_name` | 用户上传时的原始文件名，供展示和下载还原 |
-| `sha256` | 写入后计算哈希，用于去重和完整性校验 |
+| `sha256` | 去重键：多 record 可共享同一物理文件；删除时按哈希计数决定是否清理物理文件 |
 
 ### 3.2 与 artifact_states 的关系（M:N）
 
@@ -150,9 +151,59 @@ artifact_states                              file_records
 
 ## 四、核心模块设计
 
-### 4.1 文件上传（含去重 + artifact 创建）
+### 4.1 文件上传（SHA256 去重，文件与 record 分离）
 
-一次调用完成物理存储、去重、`file_records` 和 `artifact_states` 写入，返回 `string_id`。
+一次调用完成物理存储、去重检查、`file_records` 和 `artifact_states` 写入，返回 `string_id`。物理层通过 SHA256 去重：多 record 指向同一物理文件，但 record 各自独立。
+
+```python
+import hashlib
+
+class FileService:
+    def upload_and_register(
+        self, user_id: str, content: bytes,
+        original_name: str, artifact_type: str,
+        chemical_metadata: dict = None,
+        parent_artifact_id: str = None,
+    ) -> str:
+        sha256 = hashlib.sha256(content).hexdigest()
+        ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
+        file_id = generate_uuid()
+
+        # 物理层去重：相同 SHA256 的文件不重复写入
+        physical_filename = f"{sha256}.{ext}"
+        path = file_path(sha256, ext)
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(content)
+
+        # 始终创建新的 file_record
+        record = FileRecord(
+            id=file_id,
+            user_id=user_id,
+            filename=physical_filename,
+            original_name=original_name,
+            extension=ext,
+            size_bytes=len(content),
+            sha256=sha256,
+        )
+        db.add(record)
+
+        # 创建 artifact_states
+        string_id = f"{artifact_type[:3]}_{generate_short_id()}"
+        artifact = ArtifactState(
+            string_id=string_id,
+            file_server_ids=[file_id],
+            type=artifact_type,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            chemical_metadata=chemical_metadata or {},
+            parent_artifact_id=parent_artifact_id,
+            source="upload",
+        )
+        db.add(artifact)
+        db.commit()
+        return string_id
+```
 
 ### 4.2 文件下载
 
@@ -168,24 +219,30 @@ artifact_states                              file_records
             id=artifact.file_server_ids[0]
         ).first()
 
-        path = os.path.join("files", file_record.user_id,
-                            file_record.filename[:2], file_record.filename)
+        path = os.path.join("files", file_record.filename[:2],
+                            file_record.filename)
         with open(path, "rb") as f:
             return f.read()
 ```
 
-### 4.3 用户删除
+### 4.3 文件删除
 
-删除用户时清理其全部物理文件和 `file_records` 记录：
+删除 `file_record` 前检查是否仍有其他 record 指向同一物理文件，若无则一并删除物理文件。数据库操作在事务内完成，物理文件删除为 best-effort（失败由定期清理接管）：
 
 ```python
-    def delete_user_files(self, user_id: str):
-        import shutil
-        user_dir = os.path.join("files", user_id)
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir)
-        db.query(FileRecord).filter_by(user_id=user_id).delete()
-        db.commit()
+    def delete_record(self, record_id: str):
+        with db.transaction():
+            record = db.query(FileRecord).filter_by(id=record_id).first()
+            if not record:
+                return
+            db.delete(record)
+            remaining = db.query(FileRecord).filter_by(sha256=record.sha256).count()
+
+        # 物理文件删除在事务外（文件系统无法回滚）
+        if remaining == 0:
+            path = os.path.join("files", record.filename[:2], record.filename)
+            if os.path.exists(path):
+                os.remove(path)
 ```
 
 ### 4.4 定期清理
@@ -209,12 +266,14 @@ artifact_states                              file_records
         for artifact in orphan_artifacts:
             for file_id in (artifact.file_server_ids or []):
                 record = db.query(FileRecord).filter_by(id=file_id).first()
-                if record:
-                    path = os.path.join("files", record.user_id,
-                                        record.filename[:2], record.filename)
+                if not record:
+                    continue
+                db.delete(record)
+                # 物理文件只在无其他 record 引用时删除
+                if db.query(FileRecord).filter_by(sha256=record.sha256).count() == 0:
+                    path = os.path.join("files", record.filename[:2], record.filename)
                     if os.path.exists(path):
                         os.remove(path)
-                    db.delete(record)
         db.commit()
 ```
 
@@ -235,11 +294,11 @@ sequenceDiagram
     FE->>AG: POST /chat (含文件)
     AG->>FS: upload_and_register(user_id, content, name, type, metadata)
     FS->>FS: 计算 SHA256
-    alt 已存在（去重命中）
-        FS->>FS: 复用已有 file_server_id
+    alt 已存在（SHA256 命中）
+        FS->>FS: 复用已有物理文件，创建新 file_record
     else 新文件
-        FS->>FS: 写入 files/{user_id}/{id}.ext
-        FS->>FS: 写入 file_records
+        FS->>FS: 写入 files/{sha256[:2]}/{sha256}.{ext}
+        FS->>FS: 写入 file_record
     end
     FS->>FS: 写入 artifact_states (file_server_ids=[...])
     FS-->>AG: 返回 string_id
@@ -268,7 +327,7 @@ sequenceDiagram
 | 物理存储 | 本地文件系统单目录平铺 + 次级目录 | 小型服务够用，零运维成本；子目录零成本防单目录膨胀 |
 | 次级目录 | `user_id` 次级目录 | 用户 ID 不变、合法文件名；删除用户 = 删除目录 |
 | 文件命名 | `{file_id}.{ext}` | UUID + 扩展名保证唯一且可读 |
-| 去重 | SHA256 | 同文件只存一份，多 artifact_state 记录共享同一 file_server_id |
+| 去重 | SHA256（不依赖引用计数） | 多 record 共享同一物理文件；删除时按 SHA256 计数判断是否清理物理文件 |
 | 元数据分离 | `file_records` ≠ `artifact_states` | 存储信息与化学语义解耦，各自独立演进 |
 | 预留升级空间 | 预留 `file_path()` 抽象 | 日后迁移 MinIO/S3 只需改这一行实现 |
 | 不启用对象存储 | 暂不引入 MinIO/S3 | 当前规模不需要，过度设计徒增运维复杂度 |
@@ -277,6 +336,7 @@ sequenceDiagram
 | 文件清理 | 基于 conversation 状态定期清理 | 对话删除 30 天或归档 7 天后清理物理文件；不使用引用计数 |
 | Artifact ↔ File | M:N 关系 | 一个 artifact 可含多个文件；去重时多 artifact 共享同一文件 |
 | 反范式 | `file_server_ids` JSON 数组 | 仅 artifact→file 方向查询，无需反向，JSON 数组更简单 |
+| 一致性 | DB 事务 + 物理文件 best-effort | DB 层原子提交；物理文件失败由定期清理最终一致 |
 
 ---
 
