@@ -1,19 +1,19 @@
 # LASPAI 智能体文件管理端设计方案
 
-本文档描述 LASPAI 项目中文件管理服务器（File Server）的完整架构设计。文件服务器定位为 **数据服务**，统一管理物理文件存储、file_records 元数据以及 artifact_states 化学制品的全生命周期。客户端使用 SQLAlchemy ORM 连接数据库。
+本文档描述 LASPAI 项目中文件管理服务器（File Server）的完整架构设计。文件服务器基于 FastAPI 构建，定位为轻量文件存储服务，统一管理物理文件存储与 file_records 元数据。artifact_states 化学制品由外部（Agent 端 / MCP 端）管理，文件服务器不感知。
 
 ---
 
 ## 一、项目整体架构
 
-文件管理端是 LASPAI 三层架构中的数据层，负责文件物理存储及所有相关元数据管理。智能体端内部直连访问；第三方客户通过 MCP 服务端代理。
+文件管理端负责化学结构文件的物理存储与 file_records 元数据管理。智能体端内部直连访问；第三方客户通过 MCP 服务端代理。
 
 ```mermaid
 flowchart TB
     AGENT["智能体端 (lasp_agent)"]
     THIRD["第三方客户"]
 
-    AGENT -->|"直连（内部通路）"| FS["文件管理服务器<br/>(数据服务)"]
+    AGENT -->|"直连（内部通路）"| FS["文件管理服务器<br/>(FastAPI 文件服务)"]
     AGENT -->|"MCP 协议（计算调用）"| MCP["MCP 服务端<br/>(计算网关)"]
     THIRD -->|"MCP 协议 / REST（资源接口）"| MCP
 
@@ -21,15 +21,14 @@ flowchart TB
 
     FS -->|"读写"| STORAGE["物理存储 (files/)"]
     FS -->|"管理"| FILEDB["文件元数据库 (file_records)"]
-    FS -->|"管理"| AGENTDB["Agent DB<br/>(artifact_states)"]
 ```
 
 **职责边界**：
 
 | 组件 | 职责 | 不负责 |
 |------|------|--------|
-| 文件管理服务器（数据服务） | 物理存储、file_records、artifact_states 管理、去重、文件生命周期 | 化学计算调度 |
-| MCP 服务端（计算网关） | 调度计算集群、tool call 路由；对外代理文件请求（第三方通路） | 物理存储、元数据管理 |
+| 文件管理服务器（FastAPI） | 物理存储、file_records 管理、SHA256 去重 | 化学语义、artifact_states 管理 |
+| Agent 端 / MCP 端 | artifact_states 化学制品管理（string_id、元数据、派生链） | 物理文件路径管理 |
 
 **双通路说明**：
 
@@ -41,7 +40,7 @@ flowchart TB
   第三方 ──MCP/REST──▶ MCP 服务端 ──代理──▶ 文件管理服务器   ← 安全受控，统一鉴权
 ```
 
-- 智能体端直连文件服务器完成所有数据操作（物理文件 + artifact_states）
+- 智能体端直连文件服务器完成文件上传/下载；artifact_states 由 Agent 端自行管理
 - 第三方客户只能通过 MCP 服务端间接访问
 
 ### 1.1 目录结构
@@ -53,7 +52,7 @@ lasp_file_server/
 │   ├── models.py                  # ORM 模型（file_records / artifact_states 等）
 │   └── storage.py                 # 物理存储抽象（file_path 等）
 ├── services/
-│   └── file_service.py            # upload_and_register / download_by_string_id
+│   └── file_service.py            # upload / download / delete_record
 ├── main.py
 ├── requirements.txt
 └── .env
@@ -145,38 +144,37 @@ artifact_states                              file_records
 
 - `artifact_states.file_server_ids` 是 JSON 数组，存储一个或多个 `file_records.id`
 - 仅需从 artifact 查文件，无反向查询需求，因此反范式设计可行
-- 读取链路：`string_id → file_server_ids → 逐个查 file_records → 物理文件`
+- 读取链路：`string_id → artifact_states → file_server_id → 文件服务器 → 物理文件`
 
 ---
 
 ## 四、核心模块设计
 
-### 4.1 文件上传（SHA256 去重，文件与 record 分离）
+### 4.1 文件上传（SHA256 去重）
 
-一次调用完成物理存储、去重检查、`file_records` 和 `artifact_states` 写入，返回 `string_id`。物理层通过 SHA256 去重：多 record 指向同一物理文件，但 record 各自独立。
+上传文件到物理存储并创建 `file_record`，返回 `file_server_id`。artifact_states 由调用方（Agent 端 / MCP 端）另行创建：
 
 ```python
 import hashlib
 
 class FileService:
-    def upload_and_register(
+    def upload(
         self, user_id: str, content: bytes,
-        original_name: str, artifact_type: str,
-        chemical_metadata: dict = None,
-        parent_artifact_id: str = None,
+        original_name: str,
     ) -> str:
+        """上传文件，返回 file_server_id。不创建 artifact_states。"""
         sha256 = hashlib.sha256(content).hexdigest()
         ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
         file_id = generate_uuid()
 
         # 物理层去重：相同 SHA256 的文件不重复写入
         physical_filename = f"{sha256}.{ext}"
-        path = file_path(sha256, ext)
+        path = os.path.join("files", sha256[:2], physical_filename)
         if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(content)
 
-        # 始终创建新的 file_record
         record = FileRecord(
             id=file_id,
             user_id=user_id,
@@ -187,40 +185,22 @@ class FileService:
             sha256=sha256,
         )
         db.add(record)
-
-        # 创建 artifact_states
-        string_id = f"{artifact_type[:3]}_{generate_short_id()}"
-        artifact = ArtifactState(
-            string_id=string_id,
-            file_server_ids=[file_id],
-            type=artifact_type,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            chemical_metadata=chemical_metadata or {},
-            parent_artifact_id=parent_artifact_id,
-            source="upload",
-        )
-        db.add(artifact)
         db.commit()
-        return string_id
+        return file_id
 ```
+
+调用方拿到 `file_server_id` 后自行创建 artifact_states（含 `string_id`、`chemical_metadata` 等）。
 
 ### 4.2 文件下载
 
-按 `string_id` 一步完成查询和读取：
+按 `file_server_id` 读取，调用方需先从 artifact_states 获取 ID：
 
 ```python
-    def download_by_string_id(self, string_id: str) -> bytes:
-        artifact = db.query(ArtifactState).filter_by(string_id=string_id).first()
-        if not artifact or not artifact.file_server_ids:
-            raise FileNotFoundError(f"Artifact {string_id} not found")
-
-        file_record = db.query(FileRecord).filter_by(
-            id=artifact.file_server_ids[0]
-        ).first()
-
-        path = os.path.join("files", file_record.filename[:2],
-                            file_record.filename)
+    def download(self, file_server_id: str) -> bytes:
+        record = db.query(FileRecord).filter_by(id=file_server_id).first()
+        if not record:
+            raise FileNotFoundError(f"Record {file_server_id} not found")
+        path = os.path.join("files", record.filename[:2], record.filename)
         with open(path, "rb") as f:
             return f.read()
 ```
@@ -292,7 +272,7 @@ sequenceDiagram
     participant FS as 文件服务器
 
     FE->>AG: POST /chat (含文件)
-    AG->>FS: upload_and_register(user_id, content, name, type, metadata)
+    AG->>FS: upload(user_id, content, name)
     FS->>FS: 计算 SHA256
     alt 已存在（SHA256 命中）
         FS->>FS: 复用已有物理文件，创建新 file_record
@@ -300,8 +280,8 @@ sequenceDiagram
         FS->>FS: 写入 files/{sha256[:2]}/{sha256}.{ext}
         FS->>FS: 写入 file_record
     end
-    FS->>FS: 写入 artifact_states (file_server_ids=[...])
-    FS-->>AG: 返回 string_id
+    FS-->>AG: 返回 file_server_id
+    AG->>AG: 创建 artifact_states (file_server_ids=[...])
     AG-->>FE: SSE 推送上传完成
 ```
 
@@ -310,11 +290,13 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant SA as 子智能体
+    participant AG as 智能体端
     participant FS as 文件服务器
 
-    SA->>FS: download_by_string_id(string_id)
-    FS->>FS: 查 artifact_states → 获取 file_server_ids
+    SA->>AG: 查询 artifact_states → 获取 file_server_id
+    AG->>FS: download(file_server_id)
     FS->>FS: 查 file_records → 定位物理文件
+    FS-->>AG: 返回 PDB/CIF 文本内容
     FS-->>SA: 返回 PDB/CIF 文本内容
 ```
 
@@ -324,63 +306,59 @@ sequenceDiagram
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 物理存储 | 本地文件系统单目录平铺 + 次级目录 | 小型服务够用，零运维成本；子目录零成本防单目录膨胀 |
-| 次级目录 | `user_id` 次级目录 | 用户 ID 不变、合法文件名；删除用户 = 删除目录 |
-| 文件命名 | `{file_id}.{ext}` | UUID + 扩展名保证唯一且可读 |
-| 去重 | SHA256（不依赖引用计数） | 多 record 共享同一物理文件；删除时按 SHA256 计数判断是否清理物理文件 |
-| 元数据分离 | `file_records` ≠ `artifact_states` | 存储信息与化学语义解耦，各自独立演进 |
-| 预留升级空间 | 预留 `file_path()` 抽象 | 日后迁移 MinIO/S3 只需改这一行实现 |
-| 不启用对象存储 | 暂不引入 MinIO/S3 | 当前规模不需要，过度设计徒增运维复杂度 |
+| 物理存储 | SHA256 内容寻址 `files/{sha256[:2]}/{sha256}.{ext}` | 内容决定路径，天然去重，多用户透明共享；256 桶均匀分布防膨胀 |
+| 文件命名 | `{sha256}.{ext}` | 与 Git object store 同理，内容即地址 |
+| 去重 | SHA256 物理层去重，不依赖引用计数 | 多 file_record 共享同一物理文件；删除时按 SHA256 计数判断是否清理 |
+| 元数据分离 | `file_records`（FS 管）≠ `artifact_states`（外部管） | 文件服务器只管理存储元数据；化学语义由 Agent 端 / MCP 端各自管理 |
+| 预留升级 | `file_path()` 抽象 | 迁移 MinIO/S3 只需改一行实现 |
 | 大文件 | 不做分片 | 化学结构文件（PDB/CIF）通常 < 500KB，单次读写即可 |
-| 生命周期 | 文件服务器统一管理 | 物理文件 + artifact_states 同生命周期，删除时一并清理 |
-| 文件清理 | 基于 conversation 状态定期清理 | 对话删除 30 天或归档 7 天后清理物理文件；不使用引用计数 |
-| Artifact ↔ File | M:N 关系 | 一个 artifact 可含多个文件；去重时多 artifact 共享同一文件 |
-| 反范式 | `file_server_ids` JSON 数组 | 仅 artifact→file 方向查询，无需反向，JSON 数组更简单 |
+| 框架 | FastAPI | 与 Agent 端和 MCP 端技术栈一致 |
+| 生命周期 | 文件服务器只管 file_records；物理文件跟随 record | artifact_states 外部管理；物理文件在无 record 引用时由定期清理移除 |
+| 文件清理 | 基于 conversation 状态定期清理 | 对话删除 30 天或归档 7 天后清理；不使用引用计数 |
+| Artifact ↔ File | M:N，`file_server_ids` JSON 数组反范式 | 仅 artifact→file 方向查询，无需反向 |
 | 一致性 | DB 事务 + 物理文件 best-effort | DB 层原子提交；物理文件失败由定期清理最终一致 |
 
 ---
 
 ## 七、与其他模块的协作协议
 
-### 7.1 智能体端 ↔ 文件服务器（内部直连，统一入口）
-
-智能体端所有数据操作通过文件服务器一步完成，不再跨服务拼接：
+### 7.1 智能体端 ↔ 文件服务器（内部直连）
 
 ```text
 智能体端                                              文件服务器
 ───────                                              ──────────
-upload_and_register(user_id, content, ...)  ──────▶ 写物理文件 + file_records + artifact_states
-                                                        → 返回 string_id
-download_by_string_id(string_id)            ──────▶ 查 artifact_states → 查 file_records
-                                                        → 读物理文件 → 返回 bytes
-query_artifacts(user_id, type)              ──────▶ 查询 artifact_states → 返回列表
+upload(user_id, content, name)         ──────────▶ 写物理文件 + file_record → 返回 file_server_id
+download(file_server_id)               ──────────▶ 查 file_record → 读物理文件 → 返回 bytes
 ```
+
+上传完成后，智能体端自行创建 artifact_states（string_id、chemical_metadata 等），关联返回的 file_server_id。
 
 ### 7.2 MCP 服务端 ↔ 文件服务器（代理 & 计算后写入）
 
-第三方不直连文件服务器，通过 MCP 代理；MCP 自身计算产出也通过此通路写入：
+第三方不直连文件服务器，通过 MCP 代理：
 
 ```text
 MCP 服务端                                              文件服务器
 ──────────                                              ──────────
-代理上传（第三方请求）        ─────────────────────▶ upload_and_register(...) → 返回 string_id
-代理下载（第三方请求）        ─────────────────────▶ download_by_string_id(...) → 返回 bytes
-计算完成后写入               ─────────────────────▶ upload_and_register(..., source="computation")
+代理上传（第三方请求）        ─────────────────────▶ upload(...) → 返回 file_server_id
+代理下载（第三方请求）        ─────────────────────▶ download(...) → 返回 bytes
+计算完成后写入               ─────────────────────▶ upload(...)，artifact_states 由 MCP 自行创建
 ```
 
-### 7.3 两表关系映射
+### 7.3 artifact_states ↔ file_records 关系映射
 
 ```text
-artifact_states                                 file_records
-──────────────                                  ────────────
-file_server_id (FK)        ─────────────────▶  id (PK)
-string_id                                      filename
-chemical_metadata                               original_name
-type                                           size_bytes
-source                                         sha256
+artifact_states （外部管理）                 file_records （FS 管理）
+───────────────────────                    ───────────────────────
+  string_id                                  id (PK)
+  file_server_ids  ───────[ "fs_a" ]───▶    filename
+  type                                       original_name
+  chemical_metadata (JSON)                   size_bytes
+  parent_artifact_id                         sha256
+  source
 ```
 
-两表均由文件服务器管理，通过 `file_server_id` 关联。查询链路：`string_id → artifact_states → file_server_id → file_records → 物理文件`。
+两表通过 `file_server_ids` 关联。查询链路：`string_id → artifact_states → file_server_id → 文件服务器 → 物理文件`。
 
 ---
 

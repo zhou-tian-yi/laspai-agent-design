@@ -46,17 +46,18 @@ flowchart TB
 
     AGENT -->|"直连（数据存取）"| FS
     AGENT -->|"MCP 协议（计算调用）"| MCPSERVER
+    AGENT -.-|"import"| MODELS["laspai_models<br/>(共享 ORM 库)"]
+    MCPSERVER -.-|"import"| MODELS
 
-    subgraph FS["文件管理服务器 (数据服务)<br/>职责：物理存储 + 数据库管理"]
+    subgraph FS["文件管理服务器 (FastAPI 文件服务)<br/>职责：物理存储 + file_records 管理"]
         direction TB
         FS1["物理存储<br/>(files/)"]
-        subgraph DB["数据库（唯一事实来源）"]
-            direction TB
-            DB1["化学数据 / 计算结果 / 元数据"]
-            DB2["会话 / 消息记录"]
-            DB3["用户 LLM 配置"]
-            DB4["file_records / artifact_states"]
-        end
+        FS2["file_records<br/>(存储元数据)"]
+    end
+
+    subgraph DB["数据库（Agent 端 / MCP 端管理）"]
+        direction TB
+        DB1["artifact_states / conversations<br/>messages / tool_calls<br/>llm_configs / agent_users"]
     end
 
     subgraph MCPSERVER["MCP 服务端 (laspai_mcp_server)<br/>职责：计算网关"]
@@ -104,16 +105,15 @@ flowchart TB
 
 > 详细设计见 → [LASPAI MCP Server 设计方案](./LASPAI%20MCP%20Server%20设计方案.md)
 
-### 3.3 文件管理服务器（数据服务）
+### 3.3 文件管理服务器（FastAPI 文件服务）
 
 | 维度         | 说明                                                                           |
 | ------------ | ------------------------------------------------------------------------------ |
-| **核心职责** | 数据服务：物理文件存储 + 数据库管理（file_records + 业务表 + artifact_states） |
-| **对智能体端** | 直连访问，一次调用完成上传/下载/查询                                          |
-| **对 MCP 端** | 接收代理请求（第三方通路），计算完成后回写 artifact_states                     |
-| **存储方案** | `files/{user_id}/{file_id}.{ext}` 本地文件系统平铺                             |
-| **去重**     | SHA256 哈希，同文件只存一份                                                    |
-| **技术栈**   | Python + SQLAlchemy                                                  |
+| **核心职责** | 物理文件存储 + file_records 元数据管理（SHA256 内容寻址去重）                  |
+| **对智能体端** | 直连 upload / download，返回 file_server_id                                   |
+| **对 MCP 端** | 接收代理请求（第三方通路），计算完成后回写                                     |
+| **存储方案** | `files/{sha256[:2]}/{sha256}.{ext}` 内容寻址                                   |
+| **技术栈**   | Python + FastAPI                                                               |
 
 > 详细设计见 → [LASPAI 智能体文件管理端设计方案](./LASPAI%20智能体文件管理端设计方案.md)
 
@@ -121,10 +121,10 @@ flowchart TB
 
 | 维度         | 说明                                                                                     |
 | ------------ | ---------------------------------------------------------------------------------------- |
-| **定位**     | 唯一事实来源，由文件管理服务器统一管理，Agent 内部直连、第三方经 MCP 代理                |
-| **DBMS**     | MySQL（与网站本体共享实例），通过人工手写 SQL 脚本管理 schema 迁移                  |
+| **定位**     | 由 Agent 端 / MCP 端管理，file_records 由文件服务器管理                                  |
+| **DBMS**     | MySQL（与网站本体共享实例），通过人工手写 SQL 脚本管理 schema 迁移                       |
 | **存储内容** | agent_users、conversations、messages、tool_calls、llm_configs、artifact_states、file_records |
-| **访问方式** | 智能体端直连（内部通路）；MCP 服务端代理（第三方通路）                                   |
+| **模型共享** | Agent 端和 MCP 端通过 `laspai_models/` 共享库引用 ORM 模型，避免重复定义 |
 
 > 详细设计见 → [LASPAI 智能体数据库设计方案](./LASPAI%20智能体数据库设计方案.md)
 
@@ -202,6 +202,7 @@ flowchart LR
 | 智能体端 | [LASPAI 智能体端设计方案 §二](./LASPAI%20智能体端设计方案.md) |
 | MCP 服务端 | [LASPAI MCP Server 设计方案 §二](./LASPAI%20MCP%20Server%20设计方案.md) |
 | 文件管理服务器 | [LASPAI 智能体文件管理端设计方案 §一](./LASPAI%20智能体文件管理端设计方案.md) |
+| 共享 ORM 模型库 | [LASPAI 智能体数据库设计方案 §2.8](./LASPAI%20智能体数据库设计方案.md) |
 
 数据库表由 SQLAlchemy ORM 创建，迁移使用人工手写 SQL 脚本。
 

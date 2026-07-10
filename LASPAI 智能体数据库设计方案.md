@@ -1,6 +1,6 @@
 # LASPAI 智能体数据库设计方案
 
-本文档描述 LASPAI 项目中智能体端（Agent Side）的数据库架构设计。数据库与网站本体共享同一 DBMS（暂定 MySQL），但表结构设计本身是 DBMS 无关的。数据库由文件管理服务器统一管理，作为唯一事实来源。智能体端内部直连访问，第三方通过 MCP 服务端代理。  
+本文档描述 LASPAI 项目中智能体端（Agent Side）的数据库架构设计。数据库与网站本体共享同一 DBMS（暂定 MySQL），但表结构设计本身是 DBMS 无关的。各表由使用方自行管理：artifact_states 由 Agent 端 / MCP 端管理，file_records 由文件管理服务器管理。  
 客户端使用 SQLAlchemy ORM 连接数据库，迁移采用人工手写 SQL 脚本。文中的部分枚举类型 VARCHAR 在 DBMS 支持的情况下可以替换为 ENUM 类型，提高速度。
 
 ---
@@ -280,6 +280,38 @@ Agent 读取文件时一次调用即可：`string_id → file_server_ids → 逐
 
 - 清理任务与 `last_accessed_at` 无关，以 conversation 生命周期为准
 - artifact 不因文件删除而受影响
+
+### 2.8 模型基本库（`laspai_models/`）
+
+Agent 端和 MCP 端共享同一数据库实例，部分 ORM 模型（`agent_users`、`conversations`、`messages`、`tool_calls`、`llm_configs`、`artifact_states`）在两处均需使用。为避免重复定义导致的不一致，提取为独立的共享库：
+
+```text
+laspai_models/                    # 共享 ORM 模型库（git 子模块或独立 pip 包）
+├── __init__.py                   # re-export 所有模型
+├── agent_user.py
+├── conversation.py
+├── message.py
+├── tool_call.py
+├── llm_config.py
+├── artifact_state.py
+└── base.py                       # SQLAlchemy Base、Mixin（DefaultFieldsMixin 等）
+```
+
+| 要素 | 说明 |
+|------|------|
+| **引入方式** | Git submodule 或独立 pip 包，Agent 端和 MCP 端均 `pip install` |
+| **包含内容** | 所有共享表的 ORM 定义 + Base 声明 + 通用 Mixin（如 `DefaultFieldsMixin`） |
+| **不包含** | 各自独有的业务逻辑、服务层代码、API 路由 |
+| **迁移管理** | 人工手写 SQL 脚本统一存放在此库的 `migrations/` 目录中 |
+
+使用方代码示例：
+
+```python
+# Agent 端 / MCP 端各自导入
+from laspai_models import ArtifactState, Conversation, Message, ToolCall
+```
+
+> `file_records` 表仅供文件管理服务器使用，不纳入此共享库。
 
 ---
 
